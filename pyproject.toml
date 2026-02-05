@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "grpcio>=1.76.0",
     "numpy>=2.0.2",
     "pybullet-mm>=3.2.7",
     "pyspacemouse>=2.0.0",

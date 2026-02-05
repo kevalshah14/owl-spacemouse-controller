@@ -39,7 +39,7 @@ PACKAGE_DIR = os.path.join(SCRIPT_DIR, "owl_68_robot_description")
 # SpaceMouse settings (same as ball control)
 SENSITIVITY = 0.008      # meters per unit
 Z_SENSITIVITY = 0.15     # Z is slower (multiplier)
-DEADZONE = 0.12          # Ignore small inputs (increased to prevent drift)
+DEADZONE = 0.25          # Ignore small inputs (high to prevent drift)
 
 # gRPC settings
 GRPC_SERVER = "localhost:50051"
@@ -371,8 +371,12 @@ def main():
             has_input = False
             
             if spacemouse_device:
-                # Read fresh state (discard any buffered data)
+                # Read multiple times to flush buffer and get latest state
                 state = spacemouse_device.read()
+                for _ in range(5):
+                    new_state = spacemouse_device.read()
+                    if new_state is not None:
+                        state = new_state
                 
                 # Apply deadzone - set to exactly 0 if below threshold
                 raw_x = 0.0
@@ -386,11 +390,12 @@ def main():
                 if abs(state.z) > DEADZONE:
                     raw_z = state.z
                 
-                # Axis lock - only move in strongest axis
+                # Axis lock - only move in strongest axis (with minimum threshold)
                 abs_x, abs_y, abs_z = abs(raw_x), abs(raw_y), abs(raw_z)
                 max_axis = max(abs_x, abs_y, abs_z)
                 
-                if max_axis > 0:
+                # Only process if we have a clear dominant axis above minimum
+                if max_axis > DEADZONE:
                     has_input = True
                     if abs_x == max_axis:
                         dy = raw_x * sens  # SpaceMouse X → Robot Y
