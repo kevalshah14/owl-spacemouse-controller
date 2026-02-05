@@ -5,6 +5,7 @@ A PyBullet simulation for the OWL 68 robot arm with 3Dconnexion SpaceMouse contr
 ## Features
 
 - **Cartesian End-Effector Control**: Move the robot TCP (Tool Center Point) in X, Y, Z space using inverse kinematics
+- **Gripper Drill Attachment**: Includes the gripper drill end effector
 - **SpaceMouse Integration**: Direct control via 3Dconnexion SpaceMouse (wireless or wired)
 - **Axis Lock**: Only one axis moves at a time for precise positioning
 - **Deadzone Filtering**: Prevents drift from small unintentional inputs
@@ -49,13 +50,6 @@ uv run python simulate_robot.py
 
 **Axis Lock**: Only the dominant axis registers movement, making precise single-axis positioning easier.
 
-### Ball Demo
-
-A simple 2D ball control demo for testing SpaceMouse input:
-```bash
-uv run python spacemouse_ball.py
-```
-
 ## Configuration
 
 Key parameters in `simulate_robot.py`:
@@ -81,10 +75,9 @@ The simulation will automatically sync to the real robot's pose on startup.
 ```
 owl-spacemouse-controller/
 ├── simulate_robot.py          # Main robot simulation
-├── spacemouse_ball.py         # SpaceMouse test utility
 ├── owl_68_robot_description/  # Robot URDF and meshes
 │   ├── urdf/
-│   │   └── owl_68.urdf
+│   │   └── owl_68_gripper_drill.urdf
 │   └── meshes/
 └── pyproject.toml
 ```

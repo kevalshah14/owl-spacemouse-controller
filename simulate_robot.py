@@ -33,7 +33,7 @@ except ImportError as e:
     print(f"Warning: gRPC client not available: {e}")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-URDF_PATH = os.path.join(SCRIPT_DIR, "owl_68_robot_description", "urdf", "owl_68.urdf")
+URDF_PATH = os.path.join(SCRIPT_DIR, "owl_68_robot_description", "urdf", "owl_68_gripper_drill.urdf")
 PACKAGE_DIR = os.path.join(SCRIPT_DIR, "owl_68_robot_description")
 
 # SpaceMouse settings (same as ball control)
@@ -276,8 +276,16 @@ def main():
         if joint_type != p.JOINT_FIXED:
             joint_indices.append(i)
         
-        if 'tool_mount' in joint_name.lower() or 'tcp' in joint_name.lower():
+        # Look for gripper TCP (target_frame) or robot TCP
+        if 'target_frame' in joint_name.lower():
             end_effector_index = i
+        elif 'tool_mount' in joint_name.lower() or 'tcp' in joint_name.lower():
+            if end_effector_index == num_joints - 1:  # Only if not already set
+                end_effector_index = i
+    
+    # Print which end effector link we're using
+    ee_info = p.getJointInfo(robot_id, end_effector_index)
+    print(f"End effector: link {end_effector_index} ({ee_info[12].decode('utf-8')})")
     
     # Apply custom colors
     link_colors = {
