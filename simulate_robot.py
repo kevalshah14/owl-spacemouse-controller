@@ -2,7 +2,7 @@
 """
 PyBullet simulation for the OWL 68 robot arm with SpaceMouse control.
 Uses Cartesian move_to_pose control similar to python_robgpt_ws.
-Gets initial pose from real robot via gRPC.
+Gets initial pose from real robot via gRPC (robgpt_control_service).
 """
 
 import pybullet as p
@@ -11,7 +11,9 @@ import time
 import os
 import re
 import sys
+import threading
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 try:
     import pyspacemouse
@@ -20,65 +22,235 @@ except ImportError:
     SPACEMOUSE_AVAILABLE = False
     print("Warning: pyspacemouse not installed.")
 
-# Add python_robgpt_ws to path for gRPC client
-ROBGPT_WS_PATH = "/Users/keval/Documents/VSCode/python_robgpt_ws"
-if ROBGPT_WS_PATH not in sys.path:
-    sys.path.insert(0, ROBGPT_WS_PATH)
-
-GRPC_CLIENT_AVAILABLE = False
+# gRPC imports for direct robot communication
+GRPC_AVAILABLE = False
 try:
-    from src.grpc_service.robot_grpc_client import RobotGRPCClient
-    GRPC_CLIENT_AVAILABLE = True
-except ImportError as e:
-    print(f"Warning: gRPC client not available: {e}")
+    import grpc
+    import robgpt_control_service_pb2
+    import robgpt_control_service_pb2_grpc
+    GRPC_AVAILABLE = True
+except ImportError:
+    print("gRPC proto files not found. Generate them with:")
+    print("  python generate_grpc_protos.py")
+
+GRPC_ADDRESS = "localhost:50052"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 URDF_PATH = os.path.join(SCRIPT_DIR, "owl_68_robot_description", "urdf", "owl_68_gripper_drill.urdf")
 PACKAGE_DIR = os.path.join(SCRIPT_DIR, "owl_68_robot_description")
 
-# SpaceMouse settings (same as ball control)
-SENSITIVITY = 0.008      # meters per unit
+# SpaceMouse settings
+SENSITIVITY = 0.002      # meters per unit (translation mode)
 Z_SENSITIVITY = 0.15     # Z is slower (multiplier)
+ROTATION_SENSITIVITY = 0.002  # radians per unit (rotation mode)
 DEADZONE = 0.25          # Ignore small inputs (high to prevent drift)
+INPUT_SMOOTHING = 0.15   # EMA alpha for SpaceMouse input (lower=smoother, more lag)
 
-# gRPC settings
-GRPC_SERVER = "localhost:50051"
+# Real robot control settings
+REAL_ROBOT_JOINT_SPEED = 20.0     # deg/s for MoveToJoint (slower, smoother)
+REAL_ROBOT_SEND_INTERVAL = 0.025  # seconds between gRPC commands (~40Hz)
 
-
-def get_robot_pose_from_grpc() -> dict:
+def get_robot_state() -> dict:
     """
-    Get the current robot pose from the real robot via gRPC.
-    Returns position [x,y,z] and orientation quaternion [x,y,z,w].
+    Get the current robot state via gRPC (joint positions + TCP pose).
+    Uses GetRobotState for joint-level data, which is more accurate than
+    Cartesian-only GetPose when initializing a simulation.
     """
-    if not GRPC_CLIENT_AVAILABLE:
-        print("gRPC client not available, using default pose")
+    if not GRPC_AVAILABLE:
+        print("gRPC proto files not available, using default pose")
         return None
-    
+
     try:
-        print(f"Connecting to robot gRPC server at {GRPC_SERVER}...")
-        client = RobotGRPCClient()
-        
-        if client.connect(GRPC_SERVER):
-            print("Connected to gRPC server!")
-            pose = client.get_pose()
-            client.disconnect()
-            
-            if pose.get("success"):
-                print(f"Got robot pose: position={pose['position']}, orientation={pose['orientation']}")
-                return {
-                    'position': np.array(pose['position']),
-                    'orientation': np.array(pose['orientation'])  # [x,y,z,w] quaternion
-                }
-            else:
-                print(f"Failed to get pose: {pose.get('error')}")
-                return None
-        else:
-            print("Failed to connect to gRPC server")
+        channel = grpc.insecure_channel(GRPC_ADDRESS)
+        grpc.channel_ready_future(channel).result(timeout=3.0)
+        stub = robgpt_control_service_pb2_grpc.RobGPTControlServiceStub(channel)
+
+        request = robgpt_control_service_pb2.GetRobotStateRequest()
+        response = stub.GetRobotState(request, timeout=5.0)
+
+        if not response.success:
+            channel.close()
+            print(f"GetRobotState failed: {response.error_message}")
             return None
-            
-    except Exception as e:
-        print(f"gRPC error: {e}")
+
+        joint_positions = list(response.joint_positions)
+        joint_names = list(response.joint_names)
+
+        result = {
+            'joint_positions': joint_positions,
+            'joint_names': joint_names,
+        }
+
+        # Include TCP pose if the server populated it
+        if response.HasField('tcp_position') and response.HasField('tcp_orientation'):
+            result['tcp_position'] = np.array([
+                response.tcp_position.x, response.tcp_position.y, response.tcp_position.z
+            ])
+            result['tcp_orientation'] = np.array([
+                response.tcp_orientation.x, response.tcp_orientation.y,
+                response.tcp_orientation.z, response.tcp_orientation.w
+            ])
+
+        # Also get real robot's TCP via GetPose (real FK, not sim FK)
+        try:
+            pose_request = robgpt_control_service_pb2.GetPoseRequest()
+            pose_response = stub.GetPose(pose_request, timeout=5.0)
+            if pose_response.success:
+                result['real_tcp_position'] = np.array([
+                    pose_response.position.x,
+                    pose_response.position.y,
+                    pose_response.position.z,
+                ])
+                result['real_tcp_orientation'] = np.array([
+                    pose_response.orientation.x,
+                    pose_response.orientation.y,
+                    pose_response.orientation.z,
+                    pose_response.orientation.w,
+                ])
+        except Exception as e:
+            print(f"GetPose warning: {e}")
+
+        channel.close()
+
+        print(f"Got robot state: {len(joint_positions)} joints")
+        for name, pos in zip(joint_names, joint_positions):
+            print(f"  {name}: {pos:.4f} rad ({np.degrees(pos):.1f} deg)")
+        if 'real_tcp_position' in result:
+            tcp = result['real_tcp_position']
+            print(f"  Real TCP: [{tcp[0]:.4f}, {tcp[1]:.4f}, {tcp[2]:.4f}] m")
+
+        return result
+
+    except grpc.FutureTimeoutError:
+        print("Robot gRPC server not reachable (timeout)")
         return None
+    except Exception as e:
+        print(f"GetRobotState error: {e}")
+        return None
+
+
+class RealRobotController:
+    """
+    Sends joint position commands to the real robot via gRPC MoveToJoint
+    from a background thread so the main sim loop never blocks on network I/O.
+    """
+
+    def __init__(self, address: str = GRPC_ADDRESS):
+        self.address = address
+        self.channel = None
+        self.stub = None
+        self.enabled = False
+        self.connected = False
+        self.last_error = ""
+        # Shared state between main thread and sender thread
+        self._lock = threading.Lock()
+        self._joint_positions = None  # Latest joint targets to send
+        self._has_new_target = False
+        self._thread = None
+        self._stop_event = threading.Event()
+
+    def connect(self) -> bool:
+        """Establish gRPC connection to robot."""
+        if not GRPC_AVAILABLE:
+            self.last_error = "gRPC not available"
+            return False
+        try:
+            self.channel = grpc.insecure_channel(self.address)
+            grpc.channel_ready_future(self.channel).result(timeout=3.0)
+            self.stub = robgpt_control_service_pb2_grpc.RobGPTControlServiceStub(self.channel)
+            self.connected = True
+            self.last_error = ""
+            return True
+        except grpc.FutureTimeoutError:
+            self.last_error = "Connection timeout"
+            self.connected = False
+            return False
+        except Exception as e:
+            self.last_error = str(e)
+            self.connected = False
+            return False
+
+    def disconnect(self):
+        """Stop sender thread and close gRPC connection."""
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        if self.channel:
+            self.channel.close()
+            self.channel = None
+            self.stub = None
+        self.connected = False
+
+    def _sender_loop(self):
+        """Background thread that sends joint positions to the real robot at a fixed rate."""
+        while not self._stop_event.is_set():
+            if not self.enabled or not self.connected or not self.stub:
+                self._stop_event.wait(timeout=0.05)
+                continue
+
+            # Grab the latest joint targets (never hold lock while waiting)
+            joints = None
+            with self._lock:
+                if self._has_new_target:
+                    joints = self._joint_positions[:]
+                    self._has_new_target = False
+
+            if joints is None:
+                self._stop_event.wait(timeout=REAL_ROBOT_SEND_INTERVAL)
+                continue
+
+            try:
+                request = robgpt_control_service_pb2.MoveToJointRequest(
+                    joint_positions=joints,
+                    speed=REAL_ROBOT_JOINT_SPEED,
+                    wait=False,
+                )
+                response = self.stub.MoveToJoint(request, timeout=2.0)
+                if not response.success:
+                    self.last_error = response.error_message
+                else:
+                    self.last_error = ""
+            except Exception as e:
+                self.last_error = str(e)
+
+            # Sleep for the send interval
+            self._stop_event.wait(timeout=REAL_ROBOT_SEND_INTERVAL)
+
+    def _ensure_thread(self):
+        """Start the sender thread if not already running."""
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._sender_loop, daemon=True)
+            self._thread.start()
+
+    def toggle(self) -> bool:
+        """Toggle real robot control on/off. Returns new state."""
+        if not self.enabled:
+            if not self.connected:
+                if not self.connect():
+                    print(f"Cannot enable real robot: {self.last_error}")
+                    return False
+            self._ensure_thread()
+            self.enabled = True
+            print("REAL ROBOT CONTROL: ENABLED")
+        else:
+            self.enabled = False
+            print("REAL ROBOT CONTROL: DISABLED")
+        return self.enabled
+
+    def update_target(self, joint_positions: list):
+        """
+        Update the target joint positions (non-blocking). The background
+        thread picks up the latest target and sends it to the real robot.
+
+        Args:
+            joint_positions: List of 6 joint angles in radians
+        """
+        if not self.enabled or joint_positions is None:
+            return
+        with self._lock:
+            self._joint_positions = joint_positions[:]
+            self._has_new_target = True
 
 
 def create_pybullet_urdf(original_path: str, output_path: str) -> str:
@@ -113,26 +285,25 @@ class CartesianRobotController:
     """
     
     def __init__(self, robot_id: int, end_effector_index: int, joint_indices: list,
-                 initial_pose: dict = None):
+                 initial_joint_positions: list = None):
         self.robot_id = robot_id
         self.end_effector_index = end_effector_index
         self.joint_indices = joint_indices
-        
-        # Current target pose
-        self.target_position = None
-        self.target_orientation = None
-        
-        # Get initial pose from simulation first
+
+        # Apply real robot joint positions directly if available
+        if initial_joint_positions is not None:
+            for i, joint_idx in enumerate(self.joint_indices):
+                if i < len(initial_joint_positions):
+                    p.resetJointState(self.robot_id, joint_idx, initial_joint_positions[i])
+            print("Set simulation joints to match real robot")
+
+        # Read the resulting TCP pose from simulation as starting target
         self._update_current_pose()
-        
-        # Use provided initial pose if available (from real robot)
-        if initial_pose is not None:
-            self.target_position = initial_pose['position'].copy()
-            self.target_orientation = initial_pose['orientation'].copy()
-            print(f"Initialized controller with real robot pose")
-        else:
-            self.target_position = self.current_position.copy()
-            self.target_orientation = self.current_orientation.copy()
+        self.initial_position = self.current_position.copy()
+        self.initial_orientation = self.current_orientation.copy()
+        self.target_position = self.current_position.copy()
+        self.target_orientation = self.current_orientation.copy()
+        self.last_joint_positions = list(initial_joint_positions[:6]) if initial_joint_positions else None
     
     def _update_current_pose(self):
         """Update current end effector pose from simulation."""
@@ -183,6 +354,9 @@ class CartesianRobotController:
         if joint_positions is None:
             return False
         
+        # Store the first 6 joint positions (robot arm joints only, no gripper)
+        self.last_joint_positions = list(joint_positions[:6])
+
         # Apply joint positions with position control
         for i, joint_idx in enumerate(self.joint_indices):
             if i < len(joint_positions):
@@ -216,21 +390,41 @@ class CartesianRobotController:
         
         return self.move_to_pose(new_position)
 
+    def rotate_delta(self, droll: float = 0, dpitch: float = 0, dyaw: float = 0) -> bool:
+        """
+        Rotate the TCP orientation by small euler angle deltas.
+
+        Args:
+            droll, dpitch, dyaw: Delta rotation in radians (applied in robot base frame)
+
+        Returns:
+            True if successful
+        """
+        # Convert current quaternion [x,y,z,w] to scipy format
+        current_rot = Rotation.from_quat(self.target_orientation)
+        delta_rot = Rotation.from_euler('xyz', [droll, dpitch, dyaw])
+        new_rot = delta_rot * current_rot
+        new_orientation = new_rot.as_quat()  # Returns [x,y,z,w]
+
+        return self.move_to_pose(self.target_position, orientation=new_orientation)
+
 
 def main():
-    # Get initial pose from real robot via gRPC
+    # Get initial joint state from real robot via gRPC
     print("=" * 60)
-    print("Getting initial pose from real robot...")
+    print("Getting joint state from real robot...")
     print("=" * 60)
-    initial_pose = get_robot_pose_from_grpc()
-    
-    if initial_pose:
-        print(f"Using real robot pose:")
-        print(f"  Position: {initial_pose['position']}")
-        print(f"  Orientation (quat): {initial_pose['orientation']}")
+    robot_state = get_robot_state()
+
+    if robot_state:
+        print("Using real robot joint positions")
     else:
-        print("Could not get robot pose, using default position")
-    
+        print("Could not get robot state, using default position")
+
+    # Initialize real robot controller
+    real_robot = RealRobotController()
+    real_robot.connect()  # Pre-connect but don't enable yet
+
     # Initialize SpaceMouse
     spacemouse_device = None
     if SPACEMOUSE_AVAILABLE:
@@ -303,18 +497,10 @@ def main():
     for i in range(num_joints):
         p.changeVisualShape(robot_id, i, rgbaColor=link_colors.get(i, [0.6, 0.6, 0.7, 1.0]))
     
-    # Create Cartesian controller (pass initial pose from real robot if available)
+    # Create Cartesian controller (pass joint positions from real robot if available)
+    initial_joints = robot_state['joint_positions'] if robot_state else None
     controller = CartesianRobotController(robot_id, end_effector_index, joint_indices,
-                                          initial_pose=initial_pose)
-    
-    # If we got a pose from the real robot, move simulation robot to match
-    if initial_pose is not None:
-        print("Moving simulation robot to match real robot pose...")
-        controller.move_to_pose(initial_pose['position'], initial_pose['orientation'])
-        # Step simulation a few times to let robot settle
-        for _ in range(100):
-            p.stepSimulation()
-        print("Simulation robot aligned with real robot!")
+                                          initial_joint_positions=initial_joints)
     
     # Draw world coordinate axes
     axis_length = 0.3
@@ -338,24 +524,45 @@ def main():
                                        textColorRGB=[1, 1, 0], textSize=1.2)
     pose_text_id = p.addUserDebugText("TCP: ...", [0.5, 0, 0.7], 
                                       textColorRGB=[0, 1, 1], textSize=1.0)
+    robot_status_id = p.addUserDebugText("Real Robot: OFF", [0.5, 0, 0.6],
+                                         textColorRGB=[1, 0.3, 0.3], textSize=1.0)
+    mode_text_id = p.addUserDebugText("Mode: TRANSLATION (XYZ)", [0.5, 0, 0.5],
+                                       textColorRGB=[0.8, 0.8, 1.0], textSize=1.0)
     
     # Camera
-    p.resetDebugVisualizerCamera(cameraDistance=1.5, cameraYaw=90, cameraPitch=-35,
+    p.resetDebugVisualizerCamera(cameraDistance=2.0, cameraYaw=-90, cameraPitch=-15,
                                  cameraTargetPosition=[0, 0, 0.3])
     
     print("\n" + "="*60)
     print("OWL 68 Robot - Cartesian Move To Pose Control")
     print("="*60)
-    print("\nSpaceMouse controls (same as ball):")
-    print("  Push FORWARD/BACK  → Move X (red axis)")
-    print("  Push RIGHT/LEFT    → Move Y (green axis)")
-    print("  Push UP/DOWN       → Move Z (blue axis) - slower")
-    print("\n  Axis Lock: Only ONE axis moves at a time")
+    print("\nTranslation mode (default):")
+    print("  Push FORWARD/BACK  -> Move X (red axis)")
+    print("  Push RIGHT/LEFT    -> Move Y (green axis)")
+    print("  Push UP/DOWN       -> Move Z (blue axis)")
+    print("\nRotation mode:")
+    print("  Twist/tilt knob    -> Roll / Pitch / Yaw")
+    print("\n  Axis Lock: Only ONE axis at a time")
+    print(f"\n  Real robot: {'connected' if real_robot.connected else 'not connected'}")
+    print("  LEFT BUTTON:  toggle real robot control")
+    print("  RIGHT BUTTON: toggle translation/rotation mode")
     print("="*60 + "\n")
     sys.stdout.flush()
     
     # Main loop
     frame_count = 0
+    prev_button_left = False
+    prev_button_right = False
+    orientation_mode = False  # Right button toggles rotation control
+    # EMA-smoothed SpaceMouse values (translation)
+    smooth_x = 0.0
+    smooth_y = 0.0
+    smooth_z = 0.0
+    # EMA-smoothed SpaceMouse values (rotation)
+    smooth_roll = 0.0
+    smooth_pitch = 0.0
+    smooth_yaw = 0.0
+    alpha = INPUT_SMOOTHING
     try:
         while p.isConnected():
             frame_count += 1
@@ -377,38 +584,96 @@ def main():
                     new_state = spacemouse_device.read()
                     if new_state is not None:
                         state = new_state
-                
-                # Apply deadzone - set to exactly 0 if below threshold
-                raw_x = 0.0
-                raw_y = 0.0
-                raw_z = 0.0
-                
-                if abs(state.x) > DEADZONE:
-                    raw_x = state.x
-                if abs(state.y) > DEADZONE:
-                    raw_y = state.y
-                if abs(state.z) > DEADZONE:
-                    raw_z = state.z
-                
-                # Axis lock - only move in strongest axis (with minimum threshold)
-                abs_x, abs_y, abs_z = abs(raw_x), abs(raw_y), abs(raw_z)
-                max_axis = max(abs_x, abs_y, abs_z)
-                
-                # Only process if we have a clear dominant axis above minimum
-                if max_axis > DEADZONE:
-                    has_input = True
-                    if abs_x == max_axis:
-                        dy = raw_x * sens  # SpaceMouse X → Robot Y
-                        active_axis = "Y"
-                    elif abs_y == max_axis:
-                        dx = raw_y * sens  # SpaceMouse Y → Robot X
-                        active_axis = "X"
-                    else:
-                        dz = raw_z * sens * Z_SENSITIVITY
-                        active_axis = "Z"
-                    
-                    # Only move when there's active input
-                    controller.move_delta(dx, dy, dz)
+
+                # Toggle real robot on left button press (rising edge)
+                button_left = len(state.buttons) > 0 and state.buttons[0]
+                if button_left and not prev_button_left:
+                    real_robot.toggle()
+                prev_button_left = button_left
+
+                # Toggle orientation mode on right button press (rising edge)
+                button_right = len(state.buttons) > 1 and state.buttons[1]
+                if button_right and not prev_button_right:
+                    orientation_mode = not orientation_mode
+                    mode_name = "ROTATION (RPY)" if orientation_mode else "TRANSLATION (XYZ)"
+                    print(f"Mode: {mode_name}")
+                prev_button_right = button_right
+
+                drift_threshold = 0.02
+
+                if not orientation_mode:
+                    # --- Translation mode ---
+                    raw_x = state.x if abs(state.x) > DEADZONE else 0.0
+                    raw_y = state.y if abs(state.y) > DEADZONE else 0.0
+                    raw_z = state.z if abs(state.z) > DEADZONE else 0.0
+
+                    smooth_x = alpha * raw_x + (1 - alpha) * smooth_x
+                    smooth_y = alpha * raw_y + (1 - alpha) * smooth_y
+                    smooth_z = alpha * raw_z + (1 - alpha) * smooth_z
+
+                    if abs(smooth_x) < drift_threshold:
+                        smooth_x = 0.0
+                    if abs(smooth_y) < drift_threshold:
+                        smooth_y = 0.0
+                    if abs(smooth_z) < drift_threshold:
+                        smooth_z = 0.0
+
+                    # Axis lock - only move in strongest axis
+                    abs_x, abs_y, abs_z = abs(smooth_x), abs(smooth_y), abs(smooth_z)
+                    max_axis = max(abs_x, abs_y, abs_z)
+
+                    if max_axis > drift_threshold:
+                        has_input = True
+                        if abs_x == max_axis:
+                            dy = -smooth_x * sens
+                            active_axis = "Y"
+                        elif abs_y == max_axis:
+                            dx = smooth_y * sens
+                            active_axis = "X"
+                        else:
+                            dz = smooth_z * sens * Z_SENSITIVITY
+                            active_axis = "Z"
+
+                        controller.move_delta(dx, dy, dz)
+                        real_robot.update_target(controller.last_joint_positions)
+
+                else:
+                    # --- Rotation mode ---
+                    raw_roll = state.roll if abs(state.roll) > DEADZONE else 0.0
+                    raw_pitch = state.pitch if abs(state.pitch) > DEADZONE else 0.0
+                    raw_yaw = state.yaw if abs(state.yaw) > DEADZONE else 0.0
+
+                    smooth_roll = alpha * raw_roll + (1 - alpha) * smooth_roll
+                    smooth_pitch = alpha * raw_pitch + (1 - alpha) * smooth_pitch
+                    smooth_yaw = alpha * raw_yaw + (1 - alpha) * smooth_yaw
+
+                    if abs(smooth_roll) < drift_threshold:
+                        smooth_roll = 0.0
+                    if abs(smooth_pitch) < drift_threshold:
+                        smooth_pitch = 0.0
+                    if abs(smooth_yaw) < drift_threshold:
+                        smooth_yaw = 0.0
+
+                    # Axis lock - only rotate around strongest axis
+                    abs_r, abs_p, abs_yw = abs(smooth_roll), abs(smooth_pitch), abs(smooth_yaw)
+                    max_rot = max(abs_r, abs_p, abs_yw)
+
+                    if max_rot > drift_threshold:
+                        has_input = True
+                        dr = dp = dyw = 0.0
+                        rot_sens = ROTATION_SENSITIVITY
+                        if abs_r == max_rot:
+                            dr = smooth_roll * rot_sens
+                            active_axis = "Roll"
+                        elif abs_p == max_rot:
+                            dp = smooth_pitch * rot_sens
+                            active_axis = "Pitch"
+                        else:
+                            dyw = smooth_yaw * rot_sens
+                            active_axis = "Yaw"
+
+                        controller.rotate_delta(dr, dp, dyw)
+                        real_robot.update_target(controller.last_joint_positions)
             
             # Update target marker
             p.resetBasePositionAndOrientation(target_marker, 
@@ -416,14 +681,38 @@ def main():
             
             # Update debug text
             if frame_count % 10 == 0:
-                sm_text = f"SpaceMouse: dx={dx:.4f} dy={dy:.4f} dz={dz:.4f} [Axis: {active_axis}]"
+                if not orientation_mode:
+                    sm_text = f"XYZ: dx={dx:.4f} dy={dy:.4f} dz={dz:.4f} [Axis: {active_axis}]"
+                else:
+                    sm_text = f"RPY: [Axis: {active_axis}]"
                 p.addUserDebugText(sm_text, [0.5, 0, 0.8], textColorRGB=[1, 1, 0], 
                                   textSize=1.2, replaceItemUniqueId=debug_text_id)
                 
                 tcp = controller.get_tcp_pose()
+                rpy = Rotation.from_quat([tcp['qx'], tcp['qy'], tcp['qz'], tcp['qw']]).as_euler('xyz', degrees=True)
                 pose_text = f"TCP: x={tcp['x']:.3f} y={tcp['y']:.3f} z={tcp['z']:.3f}"
-                p.addUserDebugText(pose_text, [0.5, 0, 0.7], textColorRGB=[0, 1, 1], 
+                rpy_text = f"  R={rpy[0]:.1f} P={rpy[1]:.1f} Y={rpy[2]:.1f} deg"
+                p.addUserDebugText(pose_text + rpy_text, [0.5, 0, 0.7], textColorRGB=[0, 1, 1], 
                                   textSize=1.0, replaceItemUniqueId=pose_text_id)
+
+                # Update mode text
+                mode_name = "ROTATION (RPY)" if orientation_mode else "TRANSLATION (XYZ)"
+                mode_color = [1.0, 0.6, 0.2] if orientation_mode else [0.8, 0.8, 1.0]
+                p.addUserDebugText(f"Mode: {mode_name}", [0.5, 0, 0.5],
+                                   textColorRGB=mode_color, textSize=1.0,
+                                   replaceItemUniqueId=mode_text_id)
+
+                # Update real robot status text
+                if real_robot.enabled:
+                    status = "Real Robot: ON"
+                    if real_robot.last_error:
+                        status += f" (err: {real_robot.last_error})"
+                    color = [0.3, 1.0, 0.3]
+                else:
+                    status = "Real Robot: OFF"
+                    color = [1.0, 0.3, 0.3]
+                p.addUserDebugText(status, [0.5, 0, 0.6], textColorRGB=color,
+                                   textSize=1.0, replaceItemUniqueId=robot_status_id)
             
             p.stepSimulation()
             time.sleep(1./500.)
@@ -431,6 +720,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
+        real_robot.disconnect()
         if spacemouse_device:
             spacemouse_device.close()
         p.disconnect()

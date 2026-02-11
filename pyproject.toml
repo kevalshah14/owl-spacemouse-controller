@@ -9,4 +9,10 @@ dependencies = [
     "numpy>=2.0.2",
     "pybullet-mm>=3.2.7",
     "pyspacemouse>=2.0.0",
+    "scipy>=1.15.3",
+]
+
+[dependency-groups]
+dev = [
+    "grpcio-tools>=1.76.0",
 ]

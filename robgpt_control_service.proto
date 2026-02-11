@@ -1,0 +1,866 @@
+syntax = "proto3";
+
+package robgpt_control_service;
+
+// RobGPT Control Service Definition  
+service RobGPTControlService {
+  // Move robot to target pose
+  rpc MoveToPose(MoveToPoseRequest) returns (MoveToPoseResponse);
+  
+  // Get current end-effector pose
+  rpc GetPose(GetPoseRequest) returns (GetPoseResponse);
+  
+  // Get current robot joint state
+  rpc GetRobotState(GetRobotStateRequest) returns (GetRobotStateResponse);
+  
+  // Stream robot state continuously (server-side streaming)
+  rpc StreamRobotState(StreamRobotStateRequest) returns (stream GetRobotStateResponse);
+  
+  // Get robot system health
+  rpc GetSystemHealth(GetSystemHealthRequest) returns (GetSystemHealthResponse);
+  
+  // Emergency stop
+  rpc EmergencyStop(EmergencyStopRequest) returns (EmergencyStopResponse);
+  
+  // Abort current movement
+  rpc AbortMovement(AbortMovementRequest) returns (AbortMovementResponse);
+  
+  // Gripper control
+  rpc GripperOpen(GripperOpenRequest) returns (GripperOpenResponse);
+  rpc GripperClose(GripperCloseRequest) returns (GripperCloseResponse);
+  rpc GetGripperStatus(GetGripperStatusRequest) returns (GetGripperStatusResponse);
+  
+  // Vice control (OWL6_8 only)
+  rpc ViceOpen(ViceOpenRequest) returns (ViceOpenResponse);
+  rpc ViceClose(ViceCloseRequest) returns (ViceCloseResponse);
+  
+  // Teach mode control
+  rpc EnterTeachMode(EnterTeachModeRequest) returns (EnterTeachModeResponse);
+  rpc ExitTeachMode(ExitTeachModeRequest) returns (ExitTeachModeResponse);
+  rpc GetTeachModeStatus(GetTeachModeStatusRequest) returns (GetTeachModeStatusResponse);
+  
+  // Distance query
+  rpc QueryDistance(QueryDistanceRequest) returns (QueryDistanceResponse);
+  
+  // Get camera frame pose (OWL6_8 Gripper Drill only)
+  rpc GetCameraFrame(GetCameraFrameRequest) returns (GetCameraFrameResponse);
+  
+  // Direct cartesian move with target frame pose (bypasses planning pipeline)
+  rpc CartesianMoveToPose(CartesianMoveToPoseRequest) returns (CartesianMoveToPoseResponse);
+  
+  // Move to joint positions (direct joint space movement)
+  rpc MoveToJoint(MoveToJointRequest) returns (MoveToJointResponse);
+}
+
+// ============================================================================
+// Move To Pose Messages
+// ============================================================================
+
+message MoveToPoseRequest {
+  // Target position in meters
+  Position target_position = 1;
+  
+  // Target orientation as quaternion
+  Quaternion target_orientation = 2;
+  
+  // Whether to actually execute the movement (default: false for safety)
+  bool execute = 3;
+  
+  // Maximum time to wait for completion in seconds (default: 30.0)
+  double timeout = 4;
+  
+  // Request ID for tracking (optional)
+  string request_id = 5;
+  
+  // Movement speed in mm/s (optional, default: 100.0)
+  double speed = 6;
+  
+  // Whether to validate safety before execution (default: true)
+  bool validate_safety = 7;
+}
+
+message MoveToPoseResponse {
+  // Whether the movement was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Execution time in seconds
+  double execution_time = 4;
+  
+  // Planning time in seconds
+  double planning_time = 5;
+  
+  // IK solution (joint angles in radians)
+  repeated double ik_solution = 6;
+  
+  // Number of path waypoints generated
+  int32 path_waypoints = 7;
+  
+  // Number of trajectory points generated
+  int32 trajectory_points = 8;
+  
+  // Movement execution details
+  MovementExecutionDetails execution_details = 9;
+  
+  // Planned end-effector waypoints from simulation (all timesteps in target frame)
+  repeated Position planned_ee_waypoints = 10;
+  
+  // Joint trajectory data (positions, velocities, accelerations for each timestep)
+  repeated JointTrajectoryPoint trajectory = 11;
+  
+  // Joint names in order (for trajectory data labeling)
+  repeated string joint_names = 12;
+}
+
+message JointTrajectoryPoint {
+  // Joint positions in radians (ordered by joint_names)
+  repeated double joint_positions = 1;
+  
+  // Joint velocities in rad/s (ordered by joint_names)
+  repeated double joint_velocities = 2;
+  
+  // Joint accelerations in rad/s² (ordered by joint_names)
+  repeated double joint_accelerations = 3;
+  
+  // Timestamp for this trajectory point (seconds from trajectory start)
+  double timestamp = 4;
+}
+
+message MovementExecutionDetails {
+  // Final end-effector position achieved
+  Position final_position = 1;
+  
+  // Final end-effector orientation achieved
+  Quaternion final_orientation = 2;
+  
+  // Position error in meters
+  double position_error = 3;
+  
+  // Orientation error in radians
+  double orientation_error = 4;
+  
+  // Whether simulation validation passed
+  bool simulation_validated = 5;
+  
+  // Maximum simulation error
+  double max_simulation_error = 6;
+  
+  // Final joint positions achieved (radians)
+  repeated double final_joint_positions = 7;
+  
+  // Joint position errors (target - actual, radians)
+  repeated double joint_position_errors = 8;
+  
+  // Position error vector (x, y, z in meters)
+  Position position_error_vector = 9;
+  
+  // Source of feedback data (e.g., "robot_client", "safety_thread", "simulation")
+  string feedback_source = 10;
+}
+
+// ============================================================================
+// Get Pose Messages
+// ============================================================================
+
+message GetPoseRequest {
+  // Optional: Get pose for specific joint configuration
+  repeated double joint_positions = 1;
+  
+  // Whether to include velocity information
+  bool include_velocity = 2;
+}
+
+message GetPoseResponse {
+  // Whether the request was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Current end-effector position
+  Position position = 3;
+  
+  // Current end-effector orientation as quaternion
+  Quaternion orientation = 4;
+  
+  // End-effector velocity (if requested)
+  Velocity velocity = 5;
+  
+  // Timestamp of the pose data
+  double timestamp = 6;
+  
+  // Joint configuration used for forward kinematics
+  repeated double joint_positions = 7;
+}
+
+// ============================================================================
+// Get Robot State Messages
+// ============================================================================
+
+message GetRobotStateRequest {
+  // Whether to include velocity information
+  bool include_velocities = 1;
+  
+  // Whether to include torque information
+  bool include_torques = 2;
+}
+
+message StreamRobotStateRequest {
+  // Update frequency in Hz (default: 10.0, max: 100.0)
+  double frequency_hz = 1;
+  
+  // Whether to include velocity information
+  bool include_velocities = 2;
+  
+  // Whether to include torque information
+  bool include_torques = 3;
+  
+  // Client ID for tracking (optional)
+  string client_id = 4;
+  
+  // Whether to include TCP pose information
+  bool include_tcp_pose = 5;
+}
+
+message GetRobotStateResponse {
+  // Whether the request was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Current joint positions in radians
+  repeated double joint_positions = 3;
+  
+  // Joint names in order
+  repeated string joint_names = 4;
+  
+  // Joint velocities in rad/s (if requested)
+  repeated double joint_velocities = 5;
+  
+  // Joint torques in Nm (if requested)
+  repeated double joint_torques = 6;
+  
+  // Robot connection status
+  bool connected = 7;
+  
+  // Whether robot is currently executing movement
+  bool executing = 8;
+  
+  // Current movement execution status
+  string execution_status = 9;
+  
+  // Movement progress (0.0 to 1.0)
+  double movement_progress = 10;
+  
+  // Timestamp of the state data
+  double timestamp = 11;
+  
+  // TCP pose information
+  Position tcp_position = 12;
+  Quaternion tcp_orientation = 13;
+  
+  // Gripper state information
+  GripperState gripper_state = 14;
+}
+
+// ============================================================================
+// System Health Messages
+// ============================================================================
+
+message GetSystemHealthRequest {
+  // Whether to include detailed thread information
+  bool include_thread_details = 1;
+}
+
+message GetSystemHealthResponse {
+  // Whether the request was successful
+  bool success = 1;
+  
+  // Overall system state
+  string system_state = 2;
+  
+  // Total number of threads
+  int32 total_threads = 3;
+  
+  // Number of running threads
+  int32 running_threads = 4;
+  
+  // Number of threads in error state
+  int32 error_threads = 5;
+  
+  // System uptime in seconds
+  double uptime_seconds = 6;
+  
+  // Total CPU usage percentage
+  double total_cpu_percent = 7;
+  
+  // Total memory usage in MB
+  double total_memory_mb = 8;
+  
+  // Individual thread health (if requested)
+  repeated ThreadHealth thread_health = 9;
+  
+  // Safety monitoring status
+  SafetyStatus safety_status = 10;
+}
+
+message ThreadHealth {
+  // Thread identifier
+  string thread_id = 1;
+  
+  // Thread state
+  string state = 2;
+  
+  // Last heartbeat timestamp
+  double last_heartbeat = 3;
+  
+  // CPU usage percentage
+  double cpu_percent = 4;
+  
+  // Memory usage in MB
+  double memory_mb = 5;
+  
+  // Number of errors
+  int32 errors_count = 6;
+  
+  // Number of restarts
+  int32 restarts_count = 7;
+  
+  // Thread uptime in seconds
+  double uptime_seconds = 8;
+  
+  // Loop rate in Hz
+  double loop_rate_hz = 9;
+  
+  // Last error message
+  string last_error = 10;
+}
+
+message SafetyStatus {
+  // Whether safety monitoring is active
+  bool monitoring_active = 1;
+  
+  // Joint limit violations detected
+  bool joint_limit_violations = 2;
+  
+  // Collision detected
+  bool collision_detected = 3;
+  
+  // Singularity detected
+  bool singularity_detected = 4;
+  
+  // Emergency stop active
+  bool emergency_stop_active = 5;
+  
+  // Number of safety violations
+  int32 total_violations = 6;
+}
+
+// ============================================================================
+// Emergency Control Messages
+// ============================================================================
+
+message EmergencyStopRequest {
+  // Reason for emergency stop (optional)
+  string reason = 1;
+}
+
+message EmergencyStopResponse {
+  // Whether emergency stop was successful
+  bool success = 1;
+  
+  // Response message
+  string message = 2;
+  
+  // Timestamp of emergency stop
+  double timestamp = 3;
+}
+
+message AbortMovementRequest {
+  // Reason for abort (optional)
+  string reason = 1;
+}
+
+message AbortMovementResponse {
+  // Whether abort was successful
+  bool success = 1;
+  
+  // Response message
+  string message = 2;
+  
+  // Timestamp of abort
+  double timestamp = 3;
+}
+
+// ============================================================================
+// Common Data Types
+// ============================================================================
+
+message Position {
+  double x = 1;  // X coordinate in meters
+  double y = 2;  // Y coordinate in meters
+  double z = 3;  // Z coordinate in meters
+}
+
+message Quaternion {
+  double x = 1;  // X component
+  double y = 2;  // Y component
+  double z = 3;  // Z component
+  double w = 4;  // W component (scalar)
+}
+
+message Velocity {
+  // Linear velocity in m/s
+  Position linear = 1;
+  
+  // Angular velocity in rad/s
+  Position angular = 2;
+}
+
+// ============================================================================
+// Gripper Control Messages
+// ============================================================================
+
+message GripperOpenRequest {
+  // Opening speed percentage (0-100, default: 100)
+  double speed = 1;
+  
+  // Request ID for tracking (optional)
+  string request_id = 2;
+  
+  // Maximum time to wait for completion in seconds (default: 10.0)
+  double timeout = 3;
+}
+
+message GripperOpenResponse {
+  // Whether the command was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Command execution time in seconds
+  double execution_time = 4;
+}
+
+message GripperCloseRequest {
+  // Closing speed percentage (0-100, default: 100)
+  double speed = 1;
+  
+  // Maximum grip force percentage (0-100, default: 50)
+  double force = 2;
+  
+  // Request ID for tracking (optional)
+  string request_id = 3;
+  
+  // Maximum time to wait for completion in seconds (default: 10.0)
+  double timeout = 4;
+}
+
+message GripperCloseResponse {
+  // Whether the command was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Command execution time in seconds
+  double execution_time = 4;
+  
+  // Final grip force achieved (percentage)
+  double final_force = 5;
+}
+
+message GetGripperStatusRequest {
+  // Whether to include detailed sensor readings
+  bool include_raw_values = 1;
+}
+
+message GetGripperStatusResponse {
+  // Whether the request was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Connection status
+  bool connected = 3;
+  
+  // Gripper status (RESET=0, ACTIVATING=1, ACTIVE=3, ERROR=4)
+  int32 status_code = 4;
+  string status_name = 5;
+  
+  // Movement status (STOPPED=0, OPENING=1, CLOSING=2, COMPLETED=3)
+  int32 movement_status_code = 6;
+  string movement_status_name = 7;
+  
+  // Position in millimeters (0-50mm)
+  double position_mm = 8;
+  
+  // Grip force as percentage (0-100%)
+  double force_percentage = 9;
+  
+  // Motor current in milliamps
+  double current_ma = 10;
+  
+  // Control flags
+  bool gripper_activated = 11;
+  bool is_moving = 12;
+  bool is_closed = 13;
+  bool is_open = 14;
+  bool has_object = 15;
+  
+  // Raw sensor values (if requested)
+  int32 position_raw = 16;
+  int32 force_raw = 17;
+  int32 current_raw = 18;
+  
+  // Communication status
+  int32 communication_errors = 19;
+  string last_error = 20;
+  
+  // Timestamp of the status data
+  double timestamp = 21;
+}
+
+// ============================================================================
+// Vice Control Messages (OWL6_8 only)
+// ============================================================================
+
+message ViceOpenRequest {
+  // Request ID for tracking (optional)
+  string request_id = 1;
+  
+  // Maximum time to wait for completion in seconds (default: 10.0)
+  double timeout = 2;
+}
+
+message ViceOpenResponse {
+  // Whether the command was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Command execution time in seconds
+  double execution_time = 4;
+  
+  // Timestamp of the operation
+  double timestamp = 5;
+}
+
+message ViceCloseRequest {
+  // Request ID for tracking (optional)
+  string request_id = 1;
+  
+  // Maximum time to wait for completion in seconds (default: 10.0)
+  double timeout = 2;
+}
+
+message ViceCloseResponse {
+  // Whether the command was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Command execution time in seconds
+  double execution_time = 4;
+  
+  // Timestamp of the operation
+  double timestamp = 5;
+}
+
+// ============================================================================
+// Teach Mode Control Messages
+// ============================================================================
+
+message EnterTeachModeRequest {
+  // Request ID for tracking (optional)
+  string request_id = 1;
+}
+
+message EnterTeachModeResponse {
+  // Whether the command was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Timestamp of the operation
+  double timestamp = 4;
+  
+  // Whether teach mode is supported on this robot
+  bool teach_mode_supported = 5;
+  
+  // Robot type information
+  string robot_type = 6;
+}
+
+message ExitTeachModeRequest {
+  // Request ID for tracking (optional)
+  string request_id = 1;
+}
+
+message ExitTeachModeResponse {
+  // Whether the command was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Timestamp of the operation
+  double timestamp = 4;
+  
+  // Whether teach mode is supported on this robot
+  bool teach_mode_supported = 5;
+  
+  // Robot type information
+  string robot_type = 6;
+}
+
+message GetTeachModeStatusRequest {
+  // Request ID for tracking (optional)
+  string request_id = 1;
+}
+
+message GetTeachModeStatusResponse {
+  // Whether the request was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Whether the robot is currently in teach mode
+  bool is_in_teach_mode = 4;
+  
+  // Whether teach mode is supported on this robot
+  bool teach_mode_supported = 5;
+  
+  // Robot type information
+  string robot_type = 6;
+  
+  // Timestamp of the status check
+  double timestamp = 7;
+}
+
+// ============================================================================
+// Distance Query Messages
+// ============================================================================
+
+message QueryDistanceRequest {
+  // Request ID for tracking (optional)
+  string request_id = 1;
+}
+
+message QueryDistanceResponse {
+  // Whether the request was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Distance value in meters
+  double distance = 4;
+  
+  // Timestamp of the measurement
+  double timestamp = 5;
+  
+  // ToF sensor metadata and quality information
+  ToFSensorInfo sensor_info = 6;
+}
+
+// ToF sensor information and quality metrics
+message ToFSensorInfo {
+  // Whether ToF sensor hardware is available and working
+  bool sensor_available = 1;
+  
+  // Whether sensor initialization was attempted
+  bool initialization_attempted = 2;
+  
+  // Type of sensor providing the measurement
+  string sensor_type = 3;  // e.g., "VL53L4CD", "simulated", "unavailable"
+  
+  // Measurement quality indicators
+  MeasurementQuality quality = 4;
+  
+  // Number of read errors since startup
+  int32 read_errors = 5;
+  
+  // Time since last successful reading (seconds)
+  double time_since_last_reading = 6;
+  
+  // Whether the robot is in gripper mode (required for ToF sensor)
+  bool gripper_mode_active = 7;
+}
+
+// Measurement quality and confidence indicators
+message MeasurementQuality {
+  // Confidence level of the measurement (0.0 to 1.0)
+  double confidence = 1;
+  
+  // Whether the measurement has been filtered/smoothed
+  bool filtered = 2;
+  
+  // Number of valid readings used for filtering
+  int32 sample_count = 3;
+  
+  // Raw unfiltered distance (for debugging)
+  double raw_distance_cm = 4;
+  
+  // Filtered distance in centimeters (for reference)
+  double filtered_distance_cm = 5;
+}
+
+// ============================================================================
+// Gripper State Messages
+// ============================================================================
+
+message GripperState {
+  // Whether gripper is available/connected
+  bool available = 1;
+  bool connected = 2;
+  
+  // Gripper position and status
+  int32 position_raw = 3;        // Raw position (0-255)
+  double position_mm = 4;        // Position in millimeters
+  bool is_open = 5;              // True if position > 240
+  bool is_closed = 6;            // True if position <= 240
+  
+  // Additional gripper info
+  bool activated = 7;            // Whether gripper is activated
+  bool is_moving = 8;            // Whether gripper is currently moving
+  
+  // Error information
+  string error_message = 9;      // Any error messages
+  double last_update = 10;       // Timestamp of last status update
+}
+
+// ============================================================================
+// Camera Frame Messages (OWL6_8 Gripper Drill only)
+// ============================================================================
+
+message GetCameraFrameRequest {
+  // Empty - no parameters needed
+}
+
+message GetCameraFrameResponse {
+  // Whether the request was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Camera frame position in meters
+  Position camera_position = 3;
+  
+  // Camera frame orientation as quaternion [x,y,z,w]
+  Quaternion camera_orientation = 4;
+  
+  // Timestamp of the pose data
+  double timestamp = 5;
+}
+
+// ============================================================================
+// Cartesian Move to Pose Messages
+// ============================================================================
+
+message CartesianMoveToPoseRequest {
+  // Target frame position in meters
+  Position target_position = 1;
+  
+  // Target frame orientation as quaternion [x,y,z,w]
+  Quaternion target_orientation = 2;
+  
+  // Movement speed in mm/s (default: 100.0)
+  double speed = 3;
+  
+  // Whether to wait for completion (default: true)
+  bool wait = 4;
+  
+  // Request ID for tracking (optional)
+  string request_id = 5;
+  
+  // Maximum time to wait for completion in seconds (default: 30.0)
+  double timeout = 6;
+}
+
+message CartesianMoveToPoseResponse {
+  // Whether the movement was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Execution time in seconds
+  double execution_time = 4;
+}
+
+// ============================================================================
+// Move To Joint Messages
+// ============================================================================
+
+message MoveToJointRequest {
+  // Joint positions in radians (ordered: Base, Shoulder, Elbow, Wrist1, Wrist2, Wrist3)
+  // Must contain exactly 6 values
+  repeated double joint_positions = 1;
+  
+  // Movement speed in degrees/sec (default: 20.0)
+  double speed = 2;
+  
+  // Whether to wait for completion (default: true)
+  bool wait = 3;
+  
+  // Request ID for tracking (optional)
+  string request_id = 4;
+  
+  // Maximum time to wait for completion in seconds (default: 30.0)
+  double timeout = 5;
+}
+
+message MoveToJointResponse {
+  // Whether the movement was successful
+  bool success = 1;
+  
+  // Error message if failed
+  string error_message = 2;
+  
+  // Request ID for tracking
+  string request_id = 3;
+  
+  // Execution time in seconds
+  double execution_time = 4;
+}
